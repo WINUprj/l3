@@ -1,0 +1,13 @@
+<launch>
+    <arg name="veh" default="csc22918"/>
+    <arg name="int_file" default="/data/config/calibrations/camera_intrinsic/$(arg veh).yaml"/>
+    <arg name="homography_file" default="/data/hom_mat.npy"/>
+
+    <group ns="$(arg veh)">
+        <node pkg="lane_following" type="lane_following.py" name="lane_following" output="screen">
+            <param name="int_file" value="$(arg int_file)"/>
+            <param name="homography_file" value="$(arg homography_file)"/>
+            <param name="veh" value="$(arg veh)"/>
+        </node>
+    </group>
+</launch>

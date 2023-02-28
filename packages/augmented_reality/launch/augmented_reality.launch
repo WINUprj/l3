@@ -1,0 +1,11 @@
+<launch>
+    <arg name="map_file" doc="Path to a map file"/>
+    <arg name="veh" doc="Name of vehicle."/>
+
+    <group ns="$(arg veh)">
+        <node pkg="augmented_reality" type="augmented_reality.py" name="augmented_reality" output="screen">
+            <param name="map_file" value="$(arg map_file)"/>
+            <param name="veh" value="$(arg veh)"/>
+        </node>
+    </group>
+</launch>

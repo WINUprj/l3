@@ -1,0 +1,13 @@
+<launch>
+    <arg name="veh" default="csc22918"/>
+    <arg name="int_file" default="/data/config/calibrations/camera_intrinsic/$(arg veh).yaml"/>
+    <arg name="ext_file" default="/data/config/calibrations/camera_extrinsic/$(arg veh).yaml"/>
+
+    <group ns="$(arg veh)">
+        <node pkg="augmented_reality_apriltag" type="augmented_reality_apriltag.py" name="augmented_reality_apriltag" output="screen">
+            <param name="int_file" value="$(arg int_file)"/>
+            <param name="ext_file" value="$(arg ext_file)"/>
+            <param name="veh" value="$(arg veh)"/>
+        </node>
+    </group>
+</launch>

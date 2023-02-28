@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<package>
+  <name>augmented_reality</name>
+  <version>1.0.0</version>
+  <description>The augmented reality package.</description>
+
+  <license>None</license>
+  <maintainer email="haruto@ualberta.ca">Haruto Tanaka</maintainer>
+
+  <buildtool_depend>catkin</buildtool_depend>
+</package>
