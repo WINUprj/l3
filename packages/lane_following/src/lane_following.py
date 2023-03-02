@@ -6,25 +6,19 @@ Custom functionalities required for lane following.
 
 This file includes:
     - LaneFollowing class (equivalent to nodes)
-    - 
 
-Pipeline note:
-1. color detection
-2. detect line segments
-3. extract pose estimate from each segment 
-4. run PID controller
+Algorithm:
 
-TODO:
-    - Check the histogram with white curve
-    - get average center of contours
-    - If histogram does not work that much, use angle estimation.
+References
+----------
+https://medium.com/@SunEdition/lane-detection-and-turn-prediction-algorithm-for-autonomous-vehicles-6423f77dc841
 """
 import time
 import yaml
 
 import rospy
-from duckietown.dtros import DTROS, NodeType
-from duckietown_msgs.msg import WheelsCmdStamped
+from duckietown.dtros import DTROS, NodeType, TopicType
+from duckietown_msgs.msg import WheelsCmdStamped, Twist2DStamped
 from sensor_msgs.msg import CompressedImage
 
 import numpy as np
@@ -69,9 +63,8 @@ class LaneFollow(DTROS):
                  node_name="lane_follow",
                  update_freq=3,
                  is_eng=1,
-                 controller_flags=[True, True, True],
-                 init_vleft=0.5,
-                 init_vright=0.5):
+                 init_vleft=0.3,
+                 init_vright=0.3):
         super(LaneFollow, self).__init__(
             node_name=node_name,
             node_type=NodeType.GENERIC
@@ -100,16 +93,17 @@ class LaneFollow(DTROS):
         self.bridge = CvBridge()
         self.camera_mat, self.dist_coef, _, _ = parse_calib_params(int_path=self._int_path)
         self.hom_mat = np.load(self._homography_path)
+        self.zero = None
 
         # PID related parameters
-        assert sum(controller_flags) > 0, "At least one of P, I, D is needed."
-        self._controller_flags = controller_flags
-        self.P = 0.1
-        self.I = 0.01
-        self.D = 0.01
+        self.P = 0.00008
+        self.I = 0.0
+        self.D = 0.0
         self.prev_integ = 0.
         self.prev_err = 0.
         self.M = 0.
+        self.offset = -210
+        self.target = 0
 
         # Maneuvering parameters
         self.cur_vleft = init_vleft
@@ -130,9 +124,10 @@ class LaneFollow(DTROS):
             queue_size=1
         )
         self.pub_man = rospy.Publisher(
-            f"/{self._veh}/wheels_driver_node/wheels_cmd",
-            WheelsCmdStamped,
-            queue_size=1
+            f"/{self._veh}/car_cmd_switch_node/cmd",
+            Twist2DStamped,
+            queue_size=1,
+            dt_topic_type=TopicType.CONTROL
         )
 
     def publish_maneuver(self, vleft, vright):
@@ -150,42 +145,22 @@ class LaneFollow(DTROS):
                              None,
                              self.camera_mat)
     
-    def estimate_lane_median(self, cont):
-        center_x = []   # x coordinate of contours' center
+    def get_med(self, cont):
+        med = 0
+        mx_area = -1
         for c in cont:
-            mom = cv2.moments(c)    # Get momentum of a contour
-            if mom["m00"] == 0 or cv2.contourArea(c) < 900:
-                # If denomenator of momentum is 0 or area of contours are
-                # mostly equivalent to noise, ignore
-                continue
-            x = int(mom["m10"] / mom["m00"])
-            center_x.append(x)
-        
-        if len(center_x == 0):
-            return -1
-        else:
-            return int(np.median(center_x))
+            area = cv2.contourArea(c)
+            if area > mx_area:
+                mom = cv2.moments(c)    # Get momentum of a contour
+                if mom["m00"] == 0.0:
+                    # If denomenator of momentum is 0
+                    continue
+                med = int(mom["m10"] / mom["m00"])
+                mx_area = area
 
-    def validate_line_coordinates(self, yx, wx):
-        if wx == -1 and yx == -1:
-            # Both lines are lost
-            wx, yx = None, None
-        elif wx == -1 and yx >= 0:
-            # Yellow line is visible but white line is lost
-            wx = yx - (self.is_eng * self._default_width)
-        elif wx >= 0 and yx == -1:
-            # White line is visible but yellow line is lost
-            yx = wx + (self.is_eng * self._default_width)
-        elif self.is_eng == 1 and wx > yx:
-            # For English lane following, white lane must be at left
-            # So with wx > yx, we are detecting line beyond the yellow line
-            wx = yx - self._default_width
-        elif self.is_eng == -1 and wx < yx:
-            yx = wx - self._default_width
+        return med
 
-        return yx, wx
-            
-    def pid(self, cur_val, target=0):
+    def pid(self, cur_val, target):
         # Compute error
         err = cur_val - target
         print(f"Error: {err}")
@@ -194,69 +169,53 @@ class LaneFollow(DTROS):
         deriv_term = 0.
 
         # Compute P term
-        if self._controller_flags[0]:
-            prop_term = self.P * err
+        prop_term = self.P * err
         
         # Compute I term
         # Here we assume _update_frequency as dt
-        if self._controller_flags[1]:
-            integ_term = self.I * (self.prev_integ + (err * self._update_freq))
-            self.prev_integ = integ_term
+        integ_term = self.I * (self.prev_integ + (err * self._update_freq))
+        self.prev_integ = integ_term
         
         # Compute D term
-        if self._controller_flags[2]:
-            deriv_term = self.D * ((err - self.prev_err) /  self._update_freq)
-            self.prev_err = err
+        deriv_term = self.D * ((err - self.prev_err) /  self._update_freq)
+        self.prev_err = err
 
         self.M = prop_term + integ_term + deriv_term
     
-    def pid_wrapper(self, yellow_mask, white_mask):
+    #TODO: Refactor to use twisted 2D
+    def pid_wrapper(self, img, yellow_mask):
         # Mask out the 40% of upper region in the masks. As a result, we could
         # avoid the noise which are not related to lane
         yellow_mask[:int(0.4*self.height), :] = 0
-        white_mask[:int(0.4*self.height), :] = 0
+        # white_mask[:int(0.4*self.height), :] = 0        
 
-        # Warp masks with pre-calculated custom homography matrix
-        yellow_transformed = cv2.warpPerspective(yellow_mask,
-                                                 self.hom_mat,
-                                                 (self.width, self.height))
-        white_transformed = cv2.warpPerspective(white_mask,
-                                                self.hom_mat,
-                                                (self.width, self.height))
-        
         # Compute the contours
-        yellow_cont, _ = cv2.findContours(yellow_transformed,
+        yellow_cont, _ = cv2.findContours(yellow_mask,
                                           cv2.RETR_EXTERNAL,
                                           cv2.CHAIN_APPROX_SIMPLE)
-        white_cont, _ = cv2.findContours(white_transformed,
-                                         cv2.RETR_EXTERNAL,
-                                         cv2.CHAIN_APPROX_SIMPLE)
         
         # Estimate the median of where each lines are located
-        yx = self.estimate_lane_median(yellow_cont)
-        wx = self.estimate_lane_median(white_cont)
+        yx = self.get_med(yellow_cont)
 
-        # Check the validity of yx and wx values, and auto-adjust if they are not
-        yx, wx = self.validate_line_coordinates(yx, wx)
-        
-        if yx == None and wx == None:
-            raise Exception("Duckiebot lost the lines from its vision.")
-
-        # Estimate the middle point relative to middle of camera view
-        med = (yx + wx) // 2
-        med -= (self.width // 2)
-        med /= (self.width)
-        
-        # Call the pid method to run the controller
-        self.pid(med, 0)
+        self.pid(yx + self.offset, self.width//2)
         
         # Adjust the current velocity and publish
-        print(f"Yellow med: {yx}, White med: {wx}")
+        print(f"Yellow med: {yx}, med: {self.zero}")
         print(f"current M: {self.M}")
         self.cur_vleft += self.M
+        self.cur_vleft = np.clip(self.cur_vleft, 0.1, 0.5)
         self.cur_vright -= self.M
+        self.cur_vright = np.clip(self.cur_vright, 0.1, 0.5)
         print(f"Current vleft: {self.cur_vleft}, vright: {self.cur_vright}")
+
         self.publish_maneuver(self.cur_vleft, self.cur_vright)
+
+        img[:, yx] = (0, 255, 0)
+        l, h = min(yx+self.offset, self.width//2), max(yx+self.offset, self.width//2)
+        img[self.height//2, l:h] = (0, 0, 255) if (yx+self.offset > 0) else (255, 0, 0)
+        
+        img_msg = self.bridge.cv2_to_compressed_imgmsg(img)
+        self.pub_cam.publish(img_msg)
 
     def cb_col_detect(self, msg):
         if self.freq_count % self._update_freq == 0:
@@ -273,32 +232,15 @@ class LaneFollow(DTROS):
             hsv_img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
             
             yellow_mask = cv2.inRange(hsv_img, self._yellow_low, self._yellow_high)
-            white_mask = cv2.inRange(hsv_img, self._white_low, self._white_high)
-            
-            self.pid_wrapper(yellow_mask, white_mask)
 
-            yellow_contour, _ = cv2.findContours(yellow_mask,
-                                                 cv2.RETR_TREE,
-                                                 cv2.CHAIN_APPROX_SIMPLE)
-            white_contour, _ = cv2.findContours(white_mask,
-                                                cv2.RETR_TREE,
-                                                cv2.CHAIN_APPROX_SIMPLE)
+            self.pid_wrapper(img, yellow_mask)
 
-            img = cv2.drawContours(img, yellow_contour, -1, (0, 0, 255), 2)
-            img = cv2.drawContours(img, white_contour, -1, (0, 255, 0), 2)
-
-            img_msg = self.bridge.cv2_to_compressed_imgmsg(img)
-            self.pub_cam.publish(img_msg)
+            # img_msg = self.bridge.cv2_to_compressed_imgmsg(img)
+            # self.pub_cam.publish(img_msg)
 
             self.freq_count = 0
         
         self.freq_count += 1
-    
-    # def drive(self, vleft, vright):
-    #     ### Only call when it starts and when it ends
-    #     self.cur_vleft = vleft
-    #     self.cur_vright = vright
-    #     self.publish_maneuver(vleft, vright)
 
     def shutdown_hook(self):
         self.cur_vleft = 0
@@ -307,7 +249,6 @@ class LaneFollow(DTROS):
 
 if __name__ == "__main__":
     lane_following = LaneFollow()
-    # start = time.time()
-    rospy.on_shutdown(lane_following.shutdown_hook)
-    # while time.time() - start <= 6:
-    rospy.spin()
+    lane_following.publisher()
+    # rospy.on_shutdown(lane_following.shutdown_hook)
+    # rospy.spin()
