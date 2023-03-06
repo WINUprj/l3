@@ -61,10 +61,9 @@ def parse_calib_params(int_path=None, ext_path=None):
 class LaneFollow(DTROS):
     def __init__(self,
                  node_name="lane_follow",
-                 update_freq=3,
+                 update_freq=2,
                  is_eng=1,
-                 init_vleft=0.3,
-                 init_vright=0.3):
+                 init_vel=0.25):
         super(LaneFollow, self).__init__(
             node_name=node_name,
             node_type=NodeType.GENERIC
@@ -73,13 +72,9 @@ class LaneFollow(DTROS):
         self._update_freq = update_freq
         self._veh = rospy.get_param("~veh")
         self._int_path = rospy.get_param("~int_file")
-        self._homography_path = rospy.get_param("~homography_file")
         # Yellow range: https://stackoverflow.com/questions/9179189/detect-yellow-color-in-opencv
         self._yellow_low = np.array([20, 50, 50])
         self._yellow_high = np.array([30, 255, 255])
-        # White range: https://stackoverflow.com/questions/22588146/tracking-white-color-using-python-opencv
-        self._white_low = np.array([0, 0, 200])
-        self._white_high = np.array([255, 55, 255])
 
         # Callback management parameters 
         self.freq_count = 0
@@ -87,28 +82,25 @@ class LaneFollow(DTROS):
         # Comupter vision related parameters
         self.width = None
         self.height = None
-        self._thresh = 10000
-        self._default_width = 450
         self.is_eng = is_eng
         self.bridge = CvBridge()
         self.camera_mat, self.dist_coef, _, _ = parse_calib_params(int_path=self._int_path)
-        self.hom_mat = np.load(self._homography_path)
-        self.zero = None
 
         # PID related parameters
-        self.P = 0.00008
+        self.P = 0.035
         self.I = 0.0
         self.D = 0.0
         self.prev_integ = 0.
         self.prev_err = 0.
         self.M = 0.
-        self.offset = -210
+        self.offset = 0
         self.target = 0
+        self.var = 40
+        self.pv = []
 
         # Maneuvering parameters
-        self.cur_vleft = init_vleft
-        self.cur_vright = init_vright
-        self.i = 0
+        self.cur_vel = init_vel
+        self.cur_ang = 0.
         
         # Subscriber
         self.sub_cam = rospy.Subscriber(
@@ -126,16 +118,14 @@ class LaneFollow(DTROS):
         self.pub_man = rospy.Publisher(
             f"/{self._veh}/car_cmd_switch_node/cmd",
             Twist2DStamped,
-            queue_size=1,
-            dt_topic_type=TopicType.CONTROL
+            queue_size=1
         )
 
-    def publish_maneuver(self, vleft, vright):
-        msg = WheelsCmdStamped()
+    def publish_maneuver(self, vel, ang):
+        msg = Twist2DStamped()
         msg.header.stamp = rospy.Time.now()
-        msg.vel_left = vleft
-        msg.vel_right = vright
-        
+        msg.v = vel
+        msg.omega = ang
         self.pub_man.publish(msg)
 
     def undistort(self, img):
@@ -163,6 +153,8 @@ class LaneFollow(DTROS):
     def pid(self, cur_val, target):
         # Compute error
         err = cur_val - target
+        if abs(err) < self.var:
+            err = 0
         print(f"Error: {err}")
         prop_term = 0.
         integ_term = 0.
@@ -187,7 +179,6 @@ class LaneFollow(DTROS):
         # Mask out the 40% of upper region in the masks. As a result, we could
         # avoid the noise which are not related to lane
         yellow_mask[:int(0.4*self.height), :] = 0
-        # white_mask[:int(0.4*self.height), :] = 0        
 
         # Compute the contours
         yellow_cont, _ = cv2.findContours(yellow_mask,
@@ -197,25 +188,26 @@ class LaneFollow(DTROS):
         # Estimate the median of where each lines are located
         yx = self.get_med(yellow_cont)
 
+        self.pv.append(yx)
+        yx = int(np.mean(self.pv[max(-10, -len(self.pv)):]))
         self.pid(yx + self.offset, self.width//2)
         
         # Adjust the current velocity and publish
-        print(f"Yellow med: {yx}, med: {self.zero}")
-        print(f"current M: {self.M}")
-        self.cur_vleft += self.M
-        self.cur_vleft = np.clip(self.cur_vleft, 0.1, 0.5)
-        self.cur_vright -= self.M
-        self.cur_vright = np.clip(self.cur_vright, 0.1, 0.5)
-        print(f"Current vleft: {self.cur_vleft}, vright: {self.cur_vright}")
+        # print(f"yx: {yx}")
+        # print(f"current M: {self.M}")
+        self.cur_ang = -self.M
+        self.cur_ang = np.clip(self.cur_ang, -360, 360)
+        # print(f"Current angle: {self.cur_ang}")
 
-        self.publish_maneuver(self.cur_vleft, self.cur_vright)
+        self.publish_maneuver(self.cur_vel, self.cur_ang)
 
-        img[:, yx] = (0, 255, 0)
-        l, h = min(yx+self.offset, self.width//2), max(yx+self.offset, self.width//2)
-        img[self.height//2, l:h] = (0, 0, 255) if (yx+self.offset > 0) else (255, 0, 0)
+        # img[:, yx+self.offset] = (0, 255, 0)
+        # img[:, yx] = (255, 0, 0)
+        # l, h = min(yx+self.offset, self.width//2), max(yx+self.offset, self.width//2)
+        # img[self.height//2, l:h] = (0, 0, 255) if (yx+self.offset > 0) else (255, 0, 0)
         
-        img_msg = self.bridge.cv2_to_compressed_imgmsg(img)
-        self.pub_cam.publish(img_msg)
+        # img_msg = self.bridge.cv2_to_compressed_imgmsg(img)
+        # self.pub_cam.publish(img_msg)
 
     def cb_col_detect(self, msg):
         if self.freq_count % self._update_freq == 0:
@@ -235,20 +227,14 @@ class LaneFollow(DTROS):
 
             self.pid_wrapper(img, yellow_mask)
 
-            # img_msg = self.bridge.cv2_to_compressed_imgmsg(img)
-            # self.pub_cam.publish(img_msg)
-
             self.freq_count = 0
         
         self.freq_count += 1
 
     def shutdown_hook(self):
-        self.cur_vleft = 0
-        self.cur_vright = 0
-        self.publish_maneuver(self.cur_vleft, self.cur_vright)
+        self.publish_maneuver(0, 0)
 
 if __name__ == "__main__":
     lane_following = LaneFollow()
-    lane_following.publisher()
-    # rospy.on_shutdown(lane_following.shutdown_hook)
-    # rospy.spin()
+    rospy.on_shutdown(lane_following.shutdown_hook)
+    rospy.spin()

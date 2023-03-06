@@ -10,7 +10,7 @@ from geometry_msgs.msg import Quaternion, Twist, Pose, Point, Vector3, Transform
 
 from duckietown.dtros import DTROS, NodeType
 from duckietown_msgs.msg import WheelEncoderStamped
-from tf2_ros import TransformBroadcaster
+from tf2_ros import TransformBroadcaster, Buffer, TransformListener
 
 from tf import transformations as tr
 
@@ -19,10 +19,8 @@ class DeadReckoningNode(DTROS):
     """Performs deadreckoning.
     The node performs deadreckoning to estimate odometry
     based upon wheel encoder values.
-
     Args:
         node_name (:obj:`str`): a unique, descriptive name for the node that ROS will use
-
     Configuration:
         ~veh (:obj:`str`): Robot name
         ~publish_hz (:obj:`float`): Frequency at which to publish odometry
@@ -30,10 +28,8 @@ class DeadReckoningNode(DTROS):
         ~wheelbase (:obj:`float`): Lateral distance between the center of wheels (in meters)
         ~ticks_per_meter (:obj:`int`): Total encoder ticks associated with one meter of travel
         ~debug (:obj: `bool`): Enable/disable debug output
-
     Publisher:
         ~odom (:obj:`Odometry`): The computed odometry
-
     Subscribers:
         ~left_wheel_encoder_node/tick (:obj:`WheelEncoderStamped`): Encoder ticks for left wheel
         ~right_wheel_encoder_node/tick (:obj:`WheelEncoderStamped`): Encoder ticks for right wheel
@@ -52,6 +48,10 @@ class DeadReckoningNode(DTROS):
         self.target_frame = rospy.get_param("~target_frame").replace("~", self.veh)
         self.debug = rospy.get_param("~debug", False)
 
+        # Overwrite the frame names
+        self.origin_frame = f"{self.veh}/world"
+        self.target_frame = f"{self.veh}/odom"
+
         self.left_encoder_last = None
         self.right_encoder_last = None
         self.encoders_timestamp_last = None
@@ -59,8 +59,8 @@ class DeadReckoningNode(DTROS):
 
         # Current pose, forward velocity, and angular rate
         self.timestamp = None
-        self.x = 0.0
-        self.y = 0.0
+        self.x = 0.32
+        self.y = 0.32
         self.z = 0.0
         self.yaw = 0.0
         self.q = [0.0, 0.0, 0.0, 1.0]
@@ -80,6 +80,10 @@ class DeadReckoningNode(DTROS):
 
         self.sub_encoder_right = message_filters.Subscriber("~right_wheel", WheelEncoderStamped)
 
+        self.sub_transform = rospy.Subscriber(f"/{self.veh}/augmented_reality_apriltag/apriltag/transformed",
+                                              TransformStamped,
+                                              self.cb_warp)
+
         # Setup the time synchronizer
         self.ts_encoders = message_filters.ApproximateTimeSynchronizer(
             [self.sub_encoder_left, self.sub_encoder_right], 10, 0.5
@@ -96,7 +100,36 @@ class DeadReckoningNode(DTROS):
         # tf broadcaster for odometry TF
         self._tf_broadcaster = TransformBroadcaster()
 
+        # Setup buffer for lookup
+        self.buffer = Buffer()
+        self.listener = TransformListener(self.buffer)
+
         self.loginfo("Initialized")
+
+    def cb_warp(self, msg):
+        number = msg.header.frame_id.split('_')[1]
+        static_frame = f"{self.veh}/at_{number}_static"
+        estimated_odom = f"{self.veh}/estimated_odom"
+        
+        # Get transformation from world to estimated odometry w.r.t fixed apriltag
+        transform = self.buffer.lookup_transform_full(f"{self.veh}/world",
+                                                      rospy.Time(),
+                                                      estimated_odom,
+                                                      rospy.Time(),
+                                                      static_frame)
+        
+        # Publish the odometry information
+        self.x = transform.transform.translation.x
+        self.y = transform.transform.translation.y
+        self.z = transform.transform.translation.z
+
+        q = [transform.transform.rotation.x,
+                    transform.transform.rotation.y,
+                    transform.transform.rotation.z,
+                    transform.transform.rotation.w]
+
+        self.yaw = tr.euler_from_quaternion(q)[2]
+        # print("Publishing the location of robot!")
 
     def cb_ts_encoders(self, left_encoder, right_encoder):
         timestamp_now = rospy.get_time()

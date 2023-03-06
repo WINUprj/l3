@@ -5,6 +5,7 @@ import rospy
 from duckietown.dtros import DTROS, NodeType
 from std_msgs.msg import String
 from sensor_msgs.msg import CompressedImage
+from geometry_msgs.msg import TransformStamped
 from duckietown_msgs.srv import ChangePattern
 
 import numpy as np
@@ -12,6 +13,9 @@ import cv2
 from cv_bridge import CvBridge
 from dt_apriltags import Detector
 
+from tf import transformations as tr
+from tf import TransformBroadcaster
+from tf2_ros import Buffer, TransformListener
 
 def read_yaml_file(path):
     with open(path, 'r') as f:
@@ -85,8 +89,20 @@ class AprilTagAR(DTROS):
         self.pub_view = rospy.Publisher(
             f"/{self._veh}/{node_name}/image/compressed",
             CompressedImage,
-            queue_size=10
+            queue_size=1
         )
+
+        self.pub_trans = rospy.Publisher(
+            f"/{self._veh}/{node_name}/apriltag/transformed",
+            TransformStamped,
+            queue_size=1
+        )
+
+        self.trans_broadcaster = TransformBroadcaster(queue_size=1)
+
+        # Setup buffer for lookup
+        self.buffer = Buffer()
+        self.listener = TransformListener(self.buffer)
 
     def undistort(self, img):
         return cv2.undistort(img,
@@ -110,7 +126,6 @@ class AprilTagAR(DTROS):
             # Determine the decoded ID of tag, and decide the color of bbox 
             id = tag.tag_id
 
-            # TODO: determine the associated ID per sign
             tag_name = "Stop sign"
             which_tag = 's'
             col = (0, 0, 255)   # stop sign (default)
@@ -139,7 +154,7 @@ class AprilTagAR(DTROS):
         return img, n_detections, which_tag
 
     def cb_cam(self, msg):
-        if self.counts % 10 == 0:
+        if self.counts % 7 == 0:
             # Reconstruct byte sequence to image
             img = np.frombuffer(msg.data, np.uint8) 
             img = cv2.imdecode(img, cv2.IMREAD_COLOR)
@@ -151,10 +166,66 @@ class AprilTagAR(DTROS):
             gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             
             # Detect an apriltag
-            tags = self.apriltag_detector.detect(gray_img)
+            c_params = [self.camera_mat[0,0], self.camera_mat[1,1], self.camera_mat[0,2], self.camera_mat[1,2]]
+            tags = self.apriltag_detector.detect(gray_img, True, c_params, 0.065)
             
             # Plot detected features on image
             img, cnt, which_tag = self.draw_detect_results(img, tags)
+
+            if len(tags) > 0:
+                mx_area = 0
+                mx_tag = None
+                for tag in tags:
+                    (ptA, ptB, ptC, _) = tag.corners
+
+                    ptA = (int(ptA[0]), int(ptA[1]))
+                    ptB = (int(ptB[0]), int(ptB[1]))
+                    ptC = (int(ptC[0]), int(ptC[1]))
+
+                    area = abs(ptA[0]-ptB[0]) * abs(ptB[1] * ptC[1])
+                    if area > mx_area:
+                        mx_area = area
+                        mx_tag = tag
+
+                ### Broadcast the transformation between camera and apriltag  
+                # Decompose homogrpahy matrix to create 4 x 4 transformation matrix
+                M = np.identity(4)
+                M[:3, :3] = mx_tag.pose_R
+                M[:3, 3] = mx_tag.pose_t.squeeze()
+
+                translation = tr.translation_from_matrix(M)
+                quaternion = tr.quaternion_from_matrix(M)
+                
+                self.trans_broadcaster.sendTransform(translation,
+                                                    quaternion,
+                                                    rospy.Time.now(),
+                                                    f"{self._veh}/at_{mx_tag.tag_id}_estim",
+                                                    f"{self._veh}/camera_optical_frame",)
+                
+                # Lookup for the transformation from estimated apriltag location
+                # to the wheelbase
+                transform = self.buffer.lookup_transform_full(f"{self._veh}/at_{mx_tag.tag_id}_estim",
+                                                                rospy.Time(),
+                                                                f"{self._veh}/odom",
+                                                                rospy.Time(),
+                                                                f"{self._veh}/world")
+
+                # Broadcast this transformation applying to world frame
+                translation = [transform.transform.translation.x,
+                            transform.transform.translation.y,
+                            transform.transform.translation.z]
+                rotation = [transform.transform.rotation.x,
+                            transform.transform.rotation.y,
+                            transform.transform.rotation.z,
+                            transform.transform.rotation.w]
+                self.trans_broadcaster.sendTransform(translation,
+                                                    rotation,
+                                                    rospy.Time.now(),
+                                                    f"{self._veh}/estimated_odom",
+                                                    f"{self._veh}/at_{mx_tag.tag_id}_static")
+
+                # Publish the signal
+                self.pub_trans.publish(transform)
 
             # Change LED colors bases on the detected results
             led_msg = String()
