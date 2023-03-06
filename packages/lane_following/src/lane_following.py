@@ -193,21 +193,10 @@ class LaneFollow(DTROS):
         self.pid(yx + self.offset, self.width//2)
         
         # Adjust the current velocity and publish
-        # print(f"yx: {yx}")
-        # print(f"current M: {self.M}")
         self.cur_ang = -self.M
         self.cur_ang = np.clip(self.cur_ang, -360, 360)
-        # print(f"Current angle: {self.cur_ang}")
 
         self.publish_maneuver(self.cur_vel, self.cur_ang)
-
-        # img[:, yx+self.offset] = (0, 255, 0)
-        # img[:, yx] = (255, 0, 0)
-        # l, h = min(yx+self.offset, self.width//2), max(yx+self.offset, self.width//2)
-        # img[self.height//2, l:h] = (0, 0, 255) if (yx+self.offset > 0) else (255, 0, 0)
-        
-        # img_msg = self.bridge.cv2_to_compressed_imgmsg(img)
-        # self.pub_cam.publish(img_msg)
 
     def cb_col_detect(self, msg):
         if self.freq_count % self._update_freq == 0:

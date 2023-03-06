@@ -129,7 +129,6 @@ class DeadReckoningNode(DTROS):
                     transform.transform.rotation.w]
 
         self.yaw = tr.euler_from_quaternion(q)[2]
-        # print("Publishing the location of robot!")
 
     def cb_ts_encoders(self, left_encoder, right_encoder):
         timestamp_now = rospy.get_time()
